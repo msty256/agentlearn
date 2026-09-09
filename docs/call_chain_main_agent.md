@@ -832,119 +832,377 @@ params = QueryParams(
 
 ---
 
-## 第 7 章：`_query_impl` 专项详解 —— 主循环内部到底怎么转
+## 第 7 章：`_query_impl` 专项详解 —— 从上到下拆解主循环
 
-第 6 章只给了 `_query_impl` 的骨架。这一章把它**完整拆开**，讲清楚一个 `while True` 循环里每一段在干什么、按什么顺序执行、每个出口怎么终止。
+第 6 章给了 `_query_impl` 的骨架。这一章**先看全貌，再从上到下逐函数拆解**——不严格按代码行号顺序（后面才调用的函数会提前讲清楚，标注好调用时机），目标是让你合上文档能默写出整个主循环的骨架。
 
-### 7.1 总体结构（整体 → 局部）
+### 7.0 全貌：先看整体，再钻细节
 
-`_query_impl`（`query.py:2078`）是一个约 **1300 行**的函数，可以分成 **4 大块**：
+#### 7.0.1 函数签名（它是谁）
+
+```python
+async def _query_impl(                       # query.py:2078
+    params: QueryParams,                     # 唯一必填：一次 query 的全部配置
+    *,
+    terminal_holder: TerminalHolder | None = None,   # 终止结果收纳盒（可选）
+) -> AsyncGenerator[Message | StreamEvent, None]:
+```
+
+- **是 async generator**：用 `yield` 逐条吐消息，不能 `return` 值（结果写进 `terminal_holder`）
+- **被谁调**：`query()`（query.py:3436）——薄包装，负责进出 skill 作用域
+
+#### 7.0.2 整体结构：4 大块
 
 ```
 _query_impl(params, terminal_holder)
-  │
-  ├─【块 A】初始化（2078-2132）: 造状态对象、注册表、guard
-  ├─【块 B】定义嵌套函数（2134-2284）: _goal_start_turn / _exceeded_max_turns / _finish_at_max_turns
-  ├─【块 C】while True 主循环（2285-3399）: 核心
-  │    └─ 每轮: 压缩 → 调模型 → 判终止 → 执行工具 → 回填 → 检查 → 下一轮
-  └─【块 D】函数结束（3399 后）: 循环自然退出（async generator 结束）
+  |
+  |-【块 A】初始化（2078-2132）: 造状态对象、预算、guard、goal 占位
+  |-【块 B】定义嵌套函数（2134-2283）: 9 个闭包，主循环的"小工具"
+  |    +- goal 组 7 个（_goal_start_turn / _active_evaluator_goal / ...）
+  |    +- 终止组 2 个（_exceeded_max_turns / _finish_at_max_turns）
+  |-【块 C】while True 主循环（2285-3399）: 核心，每轮 7 个阶段
+  +-【块 D】函数结束: async generator 自然结束
 ```
 
-**主循环每轮的 7 个阶段**（这是本章的核心）：
+#### 7.0.3 主循环每轮的 7 个阶段（整章的地图）
 
 ```
 第 N 轮开始
-  │
-  ├─ Phase 0: 压缩（上下文太长先瘦身）
-  ├─ Phase 1: 调模型（含重试/降级）→ assistant_messages + tool_use_blocks
-  ├─ Phase 2: 判终止①（模型说完了？出错？中止？）→ 可能 return
-  ├─ Phase 3: hooks + 续写判断（要继续吗？）
-  ├─ Phase 4: 执行工具（_run_tools_partitioned）→ tool_results
-  ├─ Phase 5: 判终止②（中止？hook_stopped？工具失败？max_turns？）→ 可能 return
-  └─ Phase 6: 重建 state（原始历史+助手回复+工具结果+注入消息）→ 回到 while True
+  |
+  |- Phase 0: 压缩 + pre_llm hook + 上下文阻塞守卫（2313-2423）
+  |    上下文太长先瘦身；外部策略可改消息；超限且无法恢复 → blocking_limit
+  |
+  |- Phase 1: 调模型（2461-2610）→ assistant_messages + tool_use_blocks
+  |    含重试 lane（529 退避）、fallback 模型切换
+  |
+  |- Phase 2: 判终止①（2611-2832）—— 模型说完了吗？出错？中止？
+  |    needs_follow_up = len(tool_use_blocks) > 0
+  |    +- 无 tool_use → completed / model_error → return
+  |    +- 有 tool_use → 继续
+  |
+  |- Phase 3: hooks + 续写/预算判断（2617-3032）
+  |    post_llm hook / stop hook / token 预算 / 续写 nudge
+  |
+  |- Phase 4: 执行工具（3237-3242）→ tool_results
+  |    _run_tools_partitioned 并行/独占分批
+  |
+  |- Phase 5: 判终止②（3281-3356）—— 优先级递减
+  |    abort → hook_stopped → 工具失败循环 → max_turns
+  |
+  +- Phase 6: 重建 state（3379-3399）→ 回到 while True（下一轮）
 ```
 
-### 7.2 【块 A】初始化：攒齐"这一趟"的装备
+#### 7.0.4 所有内部函数的"家族图谱"（谁在哪个阶段被调）
 
-**真实代码**（`query.py:2104-2132`）：
+| 函数 | 定义位置 | 被谁调 / 调用时机 | 干什么 |
+|------|---------|------------------|--------|
+| `_goal_start_turn` | 2134 | 主循环每轮开始（2298） | 绑定 goal 运行时、登记本轮 |
+| `_active_evaluator_goal` | 2155 | `_goal_finish_turn`（2282）、主循环 | 查激活的评估型 goal |
+| `_goal_notice_data` | 2169 | 主循环 goal 通知（3120） | 打包 goal 状态字典 |
+| `_goal_record_usage` | 2187 | 模型回复后（2614） | 记 token 消耗 |
+| `_goal_evaluation_messages` | 2196 | `evaluate_goal` 前（3051） | 裁剪评估消息子集 |
+| `_goal_finish_tools` | 2214 | 工具执行后（3247） | 收集 steering 引导 |
+| `_goal_finish_turn` | 2233 | 每个 return 出口前 | 报告本轮结局 |
+| `_exceeded_max_turns` | 2265 | 每轮工具后（3352） | 问"轮数超了吗" |
+| `_finish_at_max_turns` | 2271 | `_exceeded_max_turns` 返回非 None 时 | 收工写 max_turns |
+
+> **读图提示**：9 个嵌套函数里，7 个是 `/goal` 生命周期钩子（把主循环事件翻译给 goal 运行时），2 个是 max_turns 终止逻辑。理解它们 = 理解主循环的关键节点在哪。
+
+---
+
+### 7.1 块 A：初始化（从上到下，逐行）
+
+#### 7.1.1 基础状态（2104-2114）
 
 ```python
+_diag = os.environ.get("CLAWCODEX_DEBUG", "").lower() in ("1", "true", "yes")
 holder = terminal_holder or TerminalHolder()          # 终止结果收纳盒
-natural_termination: list[bool] = [False]              # 自然终止标记
+natural_termination: list[bool] = [False]             # "自然终止"标记（list 包着供闭包改）
 state = QueryState(
-    messages=list(params.messages),                    # 复制消息，不污染原列表
+    messages=list(params.messages),                   # 浅拷贝消息列表
     tool_use_context=params.tool_use_context,
     max_output_tokens_override=params.max_output_tokens_override,
 )
-config = build_query_config()                          # 全局配置
+```
+
+| 行 | 作用 | 类比 |
+|----|------|------|
+| `_diag` | 诊断开关（环境变量 CLAWCODEX_DEBUG） | 调试模式灯 |
+| `holder` | 传入就用传入的，没传就新建 | 成绩单投放箱 |
+| `natural_termination` | 单元素 list 装 bool——闭包能改 | 可变的标记位 |
+| `state` | 初始 QueryState（本轮起点） | 第一张快照 |
+
+**语法讲解**：
+- `os.environ.get("CLAWCODEX_DEBUG", "")`：读环境变量，没有就给 `""`
+- `.lower() in ("1","true","yes")`：大小写归一后判断是否开启
+- `list(params.messages)`：浅拷贝——新容器，元素共享
+
+#### 7.1.2 记账与工具挂载（2115-2127）
+
+```python
+config = build_query_config()                        # 全局配置快照
 tool_failure_guard_state = create_tool_failure_loop_guard_state()  # 工具失败防循环
-budget_tracker = create_budget_tracker()               # token 预算追踪
+if getattr(params.tool_use_context, "agent_id", None) is None and params.query_source not in (
+    "compact", "session_memory",
+):
+    snapshot_output_tokens_for_turn(params.token_budget)   # 记 token 账
+budget_tracker = create_budget_tracker()             # 本趟预算记账本
 params.tool_use_context.options.tools = list(params.tools)  # 工具列表挂到上下文
 ```
 
-**语法讲解**：
+| 行 | 作用 |
+|----|------|
+| `config` | 冻结的配置快照（压缩、阻塞限制等） |
+| `tool_failure_guard_state` | 记录"哪个工具失败了几次"——跨轮存活 |
+| `if agent_id is None and query_source not in ...` | 只有主循环（非子 agent、非内部调用）才记 token 账 |
+| `budget_tracker` | 本趟 query 的 token 预算记账本 |
+| `options.tools = list(params.tools)` | 工具列表挂上共享上下文（工具执行时能查到） |
 
-| 语法 | 说明 |
-|------|------|
-| `terminal_holder or TerminalHolder()` | 传入的没有就新建一个——"有就用，没有就造" |
-| `list[bool] = [False]` | 用**单元素列表**包一个 bool——因为嵌套函数要改它，list 是可变对象，闭包能改 |
-| `QueryState(messages=list(...))` | 浅拷贝消息列表——**不复制消息对象本身**，只复制"装消息的列表" |
-| `create_tool_failure_loop_guard_state()` | 工厂函数：返回一个全新的 guard 状态对象（记录"哪个工具失败了几次"） |
+#### 7.1.3 goal 占位变量（2128-2132）
 
-### 7.3 【块 B】嵌套函数：循环的"小工具"
+```python
+goal_runtime = None
+goal_turn_id: str | None = None
+goal_turn_start_id: str | None = None
+goal_evidence_boundary_id: str | None = None
+goal_evidence_boundary_content: str | None = None
+```
 
-**`_exceeded_max_turns`**（`query.py:2265-2269`）——问"轮数超了吗"：
+**为什么先声明成 None？** 后面的嵌套函数（`_goal_*`）用 `nonlocal` 修改这些变量——**必须先在外层定义，闭包才能捕获**。这是"先占位，后使用"。
+
+#### 7.1.4 捕获父系统提示词（2261-2263）
+
+```python
+if params.system_prompt:
+    try:
+        params.tool_use_context.rendered_system_prompt = params.system_prompt
+    except Exception:
+        logger.debug("Failed to set rendered_system_prompt on tool_use_context", exc_info=True)
+```
+
+**作用**：把本次的 system prompt 存到上下文——**fork 子 agent 时要用**（保证父子字节级一致，命中 prompt 缓存）。虽然代码位置在 2261（嵌套函数定义之后），但逻辑上属于初始化的一部分。
+
+---
+
+### 7.2 块 B：嵌套函数家族（按调用时机分组讲）
+
+#### 7.2.1 终止组：max_turns 的两个函数
+
+**`_exceeded_max_turns`**（2265）——问"轮数超了吗"：
 
 ```python
 def _exceeded_max_turns(next_turn_count: int) -> int | None:
-    max_turns = int(params.max_turns or 0)          # 读外层 params
-    if max_turns and next_turn_count > max_turns:   # 设了上限且下一轮超出
-        return max_turns                            # 返回上限值（非 None = 超了）
-    return None                                     # None = 没超
+    max_turns = int(params.max_turns or 0)
+    if max_turns and next_turn_count > max_turns:
+        return max_turns          # 返回上限值（非 None = 超了）
+    return None                   # None = 没超
 ```
 
-**`_finish_at_max_turns`**（`query.py:2271-2277`）——"轮数超了，收工"：
+**`_finish_at_max_turns`**（2271）——"超了，收工"：
 
 ```python
 def _finish_at_max_turns(next_turn_count: int) -> None:
-    error = RuntimeError("max turns reached")
-    set_terminal(
-        holder,                        # ← 写进收纳盒（外层变量）
-        natural_termination,
-        Terminal(reason="max_turns", turn_count=next_turn_count),
-    )
+    set_terminal(holder, natural_termination,
+                 Terminal(reason="max_turns", turn_count=next_turn_count))
 ```
 
-**语法讲解**：
+**调用时机**：主循环 Phase 5（工具执行后、下轮前，3352-3356）：
+
+```python
+exceeded_max_turns = _exceeded_max_turns(next_turn_count)
+if exceeded_max_turns is not None:
+    yield _create_max_turns_attachment(exceeded_max_turns, next_turn_count)
+    _finish_at_max_turns(next_turn_count)
+    return
+```
+
+#### 7.2.2 goal 组：轮次生命周期（开始/结束）
+
+**`_goal_start_turn`**（2134）——**每轮开始**登记：
+
+```python
+def _goal_start_turn(tool_use_context: ToolContext) -> None:
+    nonlocal goal_runtime, goal_turn_id, goal_turn_start_id
+    goal_runtime = goal_runtime_for_context(tool_use_context)   # 绑定 goal 运行时
+    if goal_runtime is None:
+        goal_turn_id = None
+        goal_turn_start_id = None
+        return
+    goal_turn_id = goal_runtime.on_turn_start(plan_mode=...)
+    goal_turn_start_id = goal_runtime.goal_id_at_turn_start(goal_turn_id)
+```
+
+- **调用时机**：主循环 2298（每轮 `_goal_start_turn(tool_use_context)`）
+- 有 goal → 登记本轮 ID；无 goal → 清空占位
+
+**`_goal_finish_turn`**（2233）——**每轮结束**报告结局：
+
+```python
+def _goal_finish_turn(kind: str, error: BaseException | None = None) -> None:
+    nonlocal goal_turn_id, goal_turn_start_id
+    if goal_runtime is None or goal_turn_id is None:
+        return
+    turn_id = goal_turn_id
+    goal_turn_id = None            # 清空，防重复报告
+    goal_turn_start_id = None
+    if kind == "error" and error is not None:
+        goal_runtime.on_turn_error(turn_id, error)     # 出错
+    elif kind == "abort":
+        goal_runtime.on_turn_abort(turn_id)            # 中止
+    else:
+        goal_runtime.on_turn_stop(turn_id)             # 正常结束
+```
+
+- **调用时机**：主循环**每个 return 出口前**（`_goal_finish_turn("stop")` / `"error"` / `"abort"`）
+- **幂等**：先把 `goal_turn_id` 置 None，防止同一轮重复报告
+
+#### 7.2.3 goal 组：执行中（记 token / 收集 steering）
+
+**`_goal_record_usage`**（2187）——**模型回复后**记 token：
+
+```python
+def _goal_record_usage(assistant_messages) -> None:
+    if goal_runtime is None or goal_turn_id is None:
+        return
+    if candidate.goal_id != goal_turn_start_id:
+        return                      # 这轮 goal 已变，不记
+    for assistant in assistant_messages:
+        goal_runtime.on_token_usage(goal_turn_id, getattr(assistant, "usage", None) or {})
+```
+
+- **调用时机**：模型回复后（2614 `_goal_record_usage(assistant_messages)`）
+- 防御：goal 已切换就跳过
+
+**`_goal_finish_tools`**（2214）——**工具执行完**收集引导：
+
+```python
+def _goal_finish_tools(tool_use_blocks, *, handler_executed):
+    if goal_runtime is None or goal_turn_id is None:
+        return []
+    steering = []
+    for block in tool_use_blocks:
+        steering.extend(goal_runtime.on_tool_finish(
+            goal_turn_id, tool_name=block.name, call_id=block.id,
+            handler_executed=handler_executed))
+    return steering
+```
+
+- **调用时机**：工具全部执行完后（3247）
+- 收集 goal 运行时生成的 "steering 消息"（引导模型下一步），随后注入下一轮上下文
+
+#### 7.2.4 goal 组：评估（查激活 / 裁剪证据 / 打包通知）
+
+**`_active_evaluator_goal`**（2155）——查激活的评估型 goal：
+
+```python
+def _active_evaluator_goal() -> Any | None:
+    if goal_runtime is None:
+        return None
+    candidate = goal_runtime.service.get_goal(goal_runtime.thread_id)
+    if (candidate.status is ACTIVE and candidate.completion_mode is EVALUATOR):
+        return candidate
+    return None
+```
+
+- 只有"激活中 + 评估模式"才返回——区分"自动完成"和"评估完成"两种 goal 的门槛
+- 主循环用它判断：模型回复后要不要跑 `evaluate_goal`
+
+**`_goal_evaluation_messages`**（2196）——裁剪评估输入（防证据泄漏）：
+
+```python
+def _goal_evaluation_messages(evaluator_goal, messages, assistant_messages):
+    transcript = [*messages, *assistant_messages]
+    if evaluator_goal.goal_id != goal_evidence_boundary_id:
+        return transcript           # goal 没变，给全量
+    if goal_evidence_boundary_content is None:
+        return list(assistant_messages)
+    for index in range(len(messages)-1, -1, -1):
+        if str(messages[index].content) == goal_evidence_boundary_content:
+            return [*messages[index:], *assistant_messages]   # 从边界截
+    return list(assistant_messages)  # 边界被压缩丢 → 只给本轮输出
+```
+
+- **调用时机**：`evaluate_goal` 前（3051）
+- 评估器只应看到"当前 goal 的证据"，不能看到上一个 goal 的上下文
+
+**`_goal_notice_data`**（2169）——打包通知字典：
+
+```python
+return {
+    "goalId": goal.goal_id, "condition": goal.objective,
+    "state": state, "met": met, "reason": reason,
+    "turns": goal.evaluation_count,
+    "tokens": goal.tokens_used,
+    "durationSeconds": goal.time_used_seconds,
+}
+```
+
+- 纯工具函数，打包成字典塞进 `SystemMessage.data` 发给 UI/下游
+
+**语法讲解（嵌套函数特有）**：
 
 | 语法 | 说明 |
 |------|------|
-| 嵌套函数读外层变量 | 直接读 `params`、`holder`——**闭包**自动捕获，不用传参 |
-| 返回 `int \| None` | 用 `None` 表示"没有"（类似别的语言 null），调用方 `if exceeded is not None` 判断 |
-| `int(params.max_turns or 0)` | `or 0`：max_turns 是 None 就用 0，`int()` 转成整数 |
+| `nonlocal goal_runtime, ...` | 声明"我要修改外层函数的变量"（默认嵌套只能读不能改） |
+| `getattr(obj, "attr", None)` | 防御取值：没有该属性就返回 None |
+| `candidate.status is ACTIVE` | `is` 比较枚举单例（不是 `==`） |
+| `[*a, *b]` | 列表解包拼接——生成新列表 |
+| `range(len(m)-1, -1, -1)` | 反向遍历（从最后一条往前找） |
 
-### 7.4 【块 C】主循环 Phase 0-1：压缩 + 调模型
+---
 
-**Phase 0 压缩**（`query.py:2313-2334`）——上下文太长先瘦身：
+### 7.3 块 C：主循环 Phase 0-6（从上到下）
+
+#### 7.3.1 轮次开始（2285-2311）
+
+```python
+while True:
+    messages = state.messages
+    for cb in state.on_turn_start_callbacks:     # 外部注册的轮开始回调
+        cb(state)
+    tool_use_context = state.tool_use_context
+    _goal_start_turn(tool_use_context)           # <- goal 钩子：登记本轮
+    tool_use_context.tool_result_chars_so_far = 0   # 重置工具结果字符计数
+    turn_count = state.turn_count
+    yield StreamEvent(type="stream_request_start")  # 通知 UI：开始请求
+```
+
+**作用**：每轮开头重置状态、触发 goal 钩子、通知 UI。
+
+#### 7.3.2 Phase 0：压缩 + pre_llm hook + 阻塞守卫（2313-2423）
 
 ```python
 if params.pipeline_config is not None:
-    est_input_tokens = rough_token_count_estimation_for_messages(messages)  # 估算 token
-    pipeline_result = await run_compression_pipeline(
-        messages,
-        input_token_count=est_input_tokens,
-        config=params.pipeline_config,
-    )
+    est_input_tokens = rough_token_count_estimation_for_messages(messages)
+    pipeline_result = await run_compression_pipeline(messages, input_token_count=est_input_tokens, config=params.pipeline_config)
     if pipeline_result.tokens_saved > 0:
-        messages = pipeline_result.messages           # 用压缩后的消息
+        messages = pipeline_result.messages      # 用压缩后的消息
+
+current_system_prompt = params.system_prompt
+hook_result = _call_hooks_if_enabled("pre_llm", messages, current_system_prompt, state=state, params=params)
+messages = hook_result[0]
+current_system_prompt = hook_result[1]
+
+# 上下文阻塞守卫（B.4/B.5）
+if not skip_blocking_guards:
+    token_usage = rough_token_count_estimation_for_messages(messages)
+    warning = calculate_token_warning_state(token_usage, context_window)
+    if ...自动压缩连续失败且超限...:
+        yield _create_assistant_api_error_message(...)
+        set_terminal(holder, natural_termination, Terminal(reason="blocking_limit"))
+        return
+    if ...硬阻塞限...:
+        yield _create_assistant_api_error_message(...)
+        set_terminal(holder, natural_termination, Terminal(reason="blocking_limit"))
+        return
 ```
 
-**语法讲解**：`await` = 等待异步结果（压缩可能耗时）；`tokens_saved > 0` = 只有真的省了 token 才替换消息。
+**作用**：① 上下文太长先压缩；② 外部策略（pre_llm hook）可改消息/提示词；③ 超限且无法恢复 → `blocking_limit` 提前终止（省得 API 报 500）。
 
-**Phase 1 调模型**（`query.py:2496-2511`）——真正的 LLM 调用（含重试）：
+#### 7.3.3 Phase 1：调模型（重试 lane + fallback）（2461-2610）
 
 ```python
-while True:                                  # 内层重试循环
+while True:                                      # 内层重试循环
     _streamed_any[0] = False
     try:
         returned_assistants, returned_tool_blocks = await _call_model_sync(
@@ -953,127 +1211,100 @@ while True:                                  # 内层重试循环
             system_prompt=current_system_prompt,
             tools=effective_tools,
             model=tool_use_context.skill_model_override or params.model,
-            abort_signal=params.abort_controller.signal,   # 中止信号传进去
-            on_text_chunk=_marking_chunk_cb,               # 流式回调
-            extended_thinking=params.extended_thinking,
-            thinking_effort=params.thinking_effort,
+            abort_signal=params.abort_controller.signal,
+            on_text_chunk=_marking_chunk_cb,
+            ...
         )
-        break                                # 成功 → 跳出重试循环
+        break                                    # 成功 → 跳出重试循环
     except AbortError:
-        raise                                # 用户中止 → 直接抛
+        raise                                    # 用户中止 → 直接抛
     except Exception as retry_exc:
-        # 判断是否可重试 → 退避 sleep → 重试（见下）
-        ...
+        is_529 = _is_overloaded_error(retry_exc)
+        if not is_529 and not 可重试(分类): raise
+        _consecutive_529s += 1 if is_529 else 重置
+        if 529次数 >= MAX_529_RETRIES and params.fallback_model:
+            params.provider.model = params.fallback_model   # 切备用模型
+            yield SystemMessage(content="Switched to ...", level="warning")
+            continue
+        delay = 计算退避延迟() + 随机抖动()
+        yield SystemMessage(content=f"retrying in {delay:.1f}s ...")
+        await 分段sleep(delay)                   # 可被中止的等待
+        continue
 ```
 
-**重试逻辑**（`query.py:2523-2610` 精简）：
-
-```python
-is_529 = _is_overloaded_error(retry_exc)       # 服务过载？
-if not is_529 and not 可重试(分类): raise        # 不可重试直接抛
-_consecutive_529s += 1 if is_529 else 重置
-if 529次数 >= MAX_529_RETRIES and params.fallback_model:
-    params.provider.model = params.fallback_model   # 切换备用模型
-    yield SystemMessage(content="Switched to ...", level="warning")  # 通知用户
-    continue                                  # 用新模型重试
-delay = 计算退避延迟() + 随机抖动()              # 指数退避
-yield SystemMessage(content=f"retrying in {delay:.1f}s ...")
-await 分段sleep(delay)                        # 可被中止的等待
-continue                                      # 重试
-```
+**作用**：调 LLM，失败自动重试（529 退避），连续失败切 fallback 模型。
 
 **语法讲解**：
+- `_streamed_any = [False]`：单元素列表标记"已流式输出过"——已输出就不再重试（避免重复文本）
+- `f"retrying in {delay:.1f}s"`：f-string 格式化（`: .1f` 保留 1 位小数）
+- 分段 sleep（每 0.25s 检查中止信号）——不让 ESC 卡在长 sleep 里
 
-| 语法 | 说明 |
-|------|------|
-| `_streamed_any = [False]` | 单元素列表标记"是否已流式输出过内容"——若已输出过就不再重试（避免重复文本） |
-| `_marking_chunk_cb` | 包装回调：内部把 `_streamed_any[0] = True`（记录已输出）再转发给外层回调 |
-| `or params.model` | skill 有模型覆盖就用 skill 的，否则用 params.model |
-| `f"retrying in {delay:.1f}s"` | f-string 格式化：`:.1f` = 保留 1 位小数 |
-| `while _remaining > 0:` 分段 sleep | 每 0.25 秒醒来检查一次中止信号——**不让 ESC 卡在长 sleep 里** |
-
-### 7.5 【块 C】Phase 2-3：判终止① + hooks
-
-**调完模型后**（`query.py:2611-2632`）：
+#### 7.3.4 Phase 2：判终止①（2611-2832）
 
 ```python
 assistant_messages = returned_assistants
 tool_use_blocks = returned_tool_blocks
-needs_follow_up = len(tool_use_blocks) > 0      # ← 核心判断：有没有工具要执行
+needs_follow_up = len(tool_use_blocks) > 0       # <- 分水岭
+_goal_record_usage(assistant_messages)           # <- goal 钩子：记 token
 
-# post_llm hook：外部策略可修改回复
 hook_result = _call_hooks_if_enabled("post_llm", assistant_messages, tool_use_blocks, ...)
-assistant_messages = hook_result[0]
-tool_use_blocks = hook_result[1]
-```
 
-**`needs_follow_up` 是分水岭**：
-
-```text
-needs_follow_up = len(tool_use_blocks) > 0
-        │
-        ├─ False（没有工具请求）→ 走"完成"分支（Phase 2 终止）
-        └─ True（有工具请求）→ 走"执行工具"分支（Phase 4）
-```
-
-**完成分支**（`query.py:2819-2832` 精简）：
-
-```python
-if last_message and getattr(last_message, "isApiErrorMessage", False):
-    # 最后一条是 API 错误 → 处理错误
-    if 是 goal 模式: set_terminal(...Terminal(reason="model_error", error=...))
-    else: set_terminal(...Terminal(reason="completed"))    # 无 goal 时也按完成处理
+if params.abort_controller.signal.aborted:       # 用户中止
+    set_terminal(holder, natural_termination, Terminal(reason="aborted_streaming"))
     return
-# 正常完成
+
+if last_message and getattr(last_message, "isApiErrorMessage", False):
+    if 是 goal 模式:
+        set_terminal(...Terminal(reason="model_error", error=...))
+    else:
+        set_terminal(...Terminal(reason="completed"))
+    return
+
+# 没有 tool_use → 自然完成
 set_terminal(holder, natural_termination, Terminal(reason="completed"))
 return
 ```
 
-**语法讲解**：`getattr(last_message, "isApiErrorMessage", False)`——消息可能没有这个属性，默认 False；`isMeta`/`isApiErrorMessage` 是消息的标记位。
+**作用**：模型回复后判断"这轮结束了吗"——`needs_follow_up` 是分水岭：无 tool_use 则完成，有则继续。
 
-### 7.6 【块 C】Phase 4：执行工具
+#### 7.3.5 Phase 3：hooks + 续写/预算（2617-3032）
 
-**工具执行**（`query.py:3237-3242`）：
+```python
+# stop hook（后采样钩子，决定要不要强制停）
+stop_result = _call_stop_hooks(...)
+if stop_result.prevent_continuation:
+    set_terminal(holder, natural_termination, Terminal(reason="stop_hook_prevented"))
+    return
+
+# token 预算检查
+budget_decision = check_token_budget(budget_tracker, ...)
+if isinstance(budget_decision, ContinueDecision):
+    state = QueryState(messages=[*messages, *assistant_messages, UserMessage(content=budget_decision.nudge_message, isMeta=True)], ...)
+    continue                                     # 塞一条"续写提示"继续
+
+# 续写信号检测（模型输出类似"我要继续"但不带工具）
+if last_text and detect_continuation_signal(last_text):
+    state = QueryState(messages=[*messages, *assistant_messages, UserMessage(content=NUDGE_MESSAGE, isMeta=True)], ...)
+    continue
+```
+
+**作用**：执行后采样钩子（可强制停）；检查 token 预算和续写信号——需要继续就塞提示、重建 state、`continue` 下一轮。
+
+#### 7.3.6 Phase 4：执行工具（3237-3242）
 
 ```python
 tool_results = await _run_tools_partitioned(
-    tool_use_blocks,        # 模型要执行的工具列表
-    params.tool_registry,   # 工具注册表（按名字找实现）
-    tool_use_context,       # 工具上下文（权限/目录）
+    tool_use_blocks,        # 模型要执行的工具
+    params.tool_registry,   # 工具注册表
+    tool_use_context,       # 工具上下文
     effective_tools,        # 可用工具集
 )
+goal_steering_messages = _goal_finish_tools(tool_use_blocks, handler_executed=not params.abort_controller.signal.aborted)  # <- goal 钩子
 ```
 
-**执行前**，`query.py:3178-3182` 会先发"进度通知"：
+**作用**：把工具请求分批执行（并发安全的一起跑，不安全的串行），收集 goal steering 提示。
 
-```python
-for block in tool_use_blocks:
-    yield SystemMessage(
-        content=f"Running tool: {block.name}",     # 如 "Running tool: Read"
-        subtype="tool_use_progress",
-    )
-```
-
-**`_run_tools_partitioned` 内部逻辑**（它把工具按"能否并行"分批）：
-
-```python
-# _partition_tool_calls 把工具分组成批次:
-#   [并行批]: 多个并发安全工具一起跑
-#   [独占批]: 并发不安全的工具单独跑
-_batches = _partition_tool_calls(tool_use_blocks, effective_tools)
-for batch in _batches:
-    if batch.is_concurrent_safe:
-        await asyncio.gather(*[执行(t) for t in batch.blocks])   # 并行
-    else:
-        for t in batch.blocks:
-            await 执行(t)                                        # 串行
-```
-
-**语法讲解**：`asyncio.gather(*[...])` = 并发执行多个异步任务；`*` 解包列表成多个位置参数。
-
-### 7.7 【块 C】Phase 5-6：判终止② + 重建 state
-
-**执行完工具后的检查顺序**（`query.py:3281-3356`，**优先级从高到低**）：
+#### 7.3.7 Phase 5：判终止②（3281-3356）—— 优先级从高到低
 
 ```python
 # ① 用户中止（最高优先）
@@ -1092,16 +1323,18 @@ if guard_decision.tripped:
     set_terminal(holder, natural_termination, Terminal(reason="tool_failure_loop"))
     return
 
-# ④ max_turns（轮数上限）
+# ④ max_turns（轮数上限）→ 用嵌套函数
 next_turn_count = turn_count + 1
 exceeded_max_turns = _exceeded_max_turns(next_turn_count)
 if exceeded_max_turns is not None:
     yield _create_max_turns_attachment(exceeded_max_turns, next_turn_count)
-    _finish_at_max_turns(next_turn_count)
+    _finish_at_max_turns(next_turn_count)        # <- 终止组钩子
     return
 ```
 
-**最后，重建 state**（`query.py:3379-3399`）——这是"观察回填"的实现：
+**作用**：工具执行完，按优先级检查 4 种终止条件。
+
+#### 7.3.8 Phase 6：重建 state（3379-3399）
 
 ```python
 state = QueryState(
@@ -1110,7 +1343,7 @@ state = QueryState(
         *assistant_messages,    # 助手回复（含 tool_use）
         *tool_results,          # 工具结果（回填！）
         *advisory_messages,     # 工具失败建议
-        *injected_messages,     # goal 提示 + 用户注入消息
+        *injected_messages,     # goal 提示 + 用户注入
     ],
     tool_use_context=tool_use_context,
     turn_count=next_turn_count,          # 轮数 +1
@@ -1119,121 +1352,115 @@ state = QueryState(
 # 回到 while True → 下一轮：模型看到完整对话（含工具结果）
 ```
 
-**语法讲解**：
+**作用**：把原始历史 + 助手回复 + 工具结果拼成新快照——这就是"观察回填"的实现，也是"不可变快照"设计的核心。
 
-| 语法 | 说明 |
-|------|------|
-| `[*a, *b, *c]` | **列表解包**：把多个列表平铺成一个新列表——"拼接"的简洁写法 |
-| `Transition(reason="next_turn")` | 记录"为什么进入这个状态"——调试/追溯用 |
-| `turn_count=next_turn_count` | 每轮 +1，供 max_turns 判断 |
+---
 
-### 7.8 完整流程图（一图看懂）
+### 7.4 每个出口的终止路径（汇总）
 
-```
-┌───────────── while True（第 N 轮）─────────────┐
-│                                                │
-│  Phase 0: 压缩流水线（token 超限时）             │
-│      ↓                                         │
-│  Phase 1: _call_model_sync() 调模型             │
-│      │  内层重试循环: 529/限流 → 退避 → 重试      │
-│      │  连续 529 → 切 fallback_model            │
-│      ↓                                         │
-│  Phase 2: needs_follow_up = 有 tool_use 吗？    │
-│      ├─ 没有 → completed / model_error → return │
-│      └─ 有 → 继续                              │
-│      ↓                                         │
-│  Phase 3: post_llm hook + 续写判断              │
-│      ↓                                         │
-│  Phase 4: _run_tools_partitioned() 执行工具     │
-│      │  并行批 / 独占批 → tool_results          │
-│      ↓                                         │
-│  Phase 5: 终止检查（优先级递减）                 │
-│      ├─ abort?        → aborted_tools → return │
-│      ├─ hook_stopped? → hook_stopped → return  │
-│      ├─ 工具失败循环?   → tool_failure_loop → return │
-│      └─ max_turns?    → max_turns → return     │
-│      ↓                                         │
-│  Phase 6: 重建 state（历史+回复+结果+注入）       │
-│      └─ 回到 while True（第 N+1 轮）            │
-└────────────────────────────────────────────────┘
-```
+| 出口位置 | 条件 | Terminal.reason |
+|---------|------|-----------------|
+| Phase 0（压缩守卫） | 上下文超限且无法恢复 | `blocking_limit` |
+| Phase 1（调模型异常） | AbortError / 不可重试错误 | 向上抛 / `model_error` |
+| Phase 2（模型回复后） | 用户中止 | `aborted_streaming` |
+| Phase 2 | API 错误消息 + goal 模式 | `model_error` |
+| Phase 2 | API 错误消息 + 非 goal | `completed` |
+| Phase 2 | 没有 tool_use | `completed` |
+| Phase 3（stop hook） | hook 阻止继续 | `stop_hook_prevented` |
+| Phase 5（工具执行后） | 用户中止 | `aborted_tools` |
+| Phase 5 | hook_stopped 标记 | `hook_stopped` |
+| Phase 5 | 工具失败循环 | `tool_failure_loop` |
+| Phase 5 | 轮数超限 | `max_turns` |
 
-### 7.9 具体参数示例（走一遍真实数据）
+**调用方怎么知道为什么停**：`query()` 是 async generator 不能 return 值（PEP 525），所以每个出口先 `set_terminal()` 写进 `TerminalHolder.value`，调用方事后读 `holder.value.reason`。
+
+---
+
+### 7.5 具体参数示例（走一遍真实数据）
+
+**场景 1：用户说 "帮我读一下 config.yaml"，第一轮模型就要读文件**
 
 ```python
-# 场景: 用户说 "帮我读一下 config.yaml"
-# 假设第一轮模型回复:
 assistant_messages = [AssistantMessage(content="好的，我来读配置文件")]
 tool_use_blocks = [ToolUseBlock(name="Read", input={"path": "config.yaml"})]
-needs_follow_up = True          # 有工具请求
+needs_follow_up = True          # 有工具请求 → 走 Phase 4
 
-# Phase 4 执行工具:
 tool_results = [UserMessage(content=[ToolResultBlock(tool_use_id="toolu_01", content="server:\n  port: 8080")])]
 
 # Phase 6 重建 state（第二轮模型看到）:
 state.messages = [
-    UserMessage("帮我读一下 config.yaml"),          # 原始
-    AssistantMessage("好的，我来读配置文件"),        # 助手回复
-    UserMessage(content="server:\n  port: 8080"),  # 工具结果回填
+    UserMessage("帮我读一下 config.yaml"),
+    AssistantMessage("好的，我来读配置文件"),
+    UserMessage(content="server:\n  port: 8080"),   # 工具结果回填
 ]
 
 # 第二轮: 模型看到文件内容 → 回复 "config.yaml 配置了端口 8080"（没有 tool_use）
 needs_follow_up = False
-# Phase 2: → set_terminal(Terminal(reason="completed")) → return
+set_terminal(holder, natural_termination, Terminal(reason="completed"))
+return
 ```
 
+**场景 2：连续 529 过载 → 模型降级**
+
 ```python
-# 场景: 连续 529 过载 → 模型降级
-# 第 4 次 529 后（MAX_529_RETRIES=3）:
+# MAX_529_RETRIES = 3（query.py:142）
 _consecutive_529s = 4
 if is_529 and _consecutive_529s >= 3 and params.fallback_model:
-    params.provider.model = "deepseek-chat"        # 从 claude-sonnet 切到备用
+    params.provider.model = "deepseek-chat"        # 切备用模型
     yield SystemMessage(content="Switched to deepseek-chat due to high demand for claude-sonnet-4")
     _consecutive_529s = 0
     continue                                       # 用新模型重试
 ```
 
+**场景 3：max_turns=5，第 5 轮结束工具执行后**
+
 ```python
-# 场景: max_turns=5，第 5 轮结束工具执行后:
 next_turn_count = 5 + 1 = 6
 _exceeded_max_turns(6) → max_turns=5, 6 > 5 → 返回 5（非 None）
-yield _create_max_turns_attachment(5, 6)           # 通知"达到上限"
+yield _create_max_turns_attachment(5, 6)
 _finish_at_max_turns(6) → set_terminal(Terminal(reason="max_turns", turn_count=6))
 return
 ```
 
-### 7.10 反问题（自测）
+---
 
-**Q1.** `needs_follow_up` 是怎么算的？它决定了什么？
+### 7.6 反问题（自测）
+
+**Q1.** `_query_impl` 为什么要有 9 个嵌套函数，不直接写在主循环里？
+
+<details><summary>答案</summary>
+**可读性 + 闭包共享**。9 个函数都是主循环的"片段逻辑"，抽成有名字的函数让 1300 行的循环体更清晰；且它们用 `nonlocal` 共享外层变量（`goal_runtime`、`holder` 等），不用在参数里来回传递。goal 组把"主循环事件→goal 运行时调用"的翻译集中一处。
+</details>
+
+**Q2.** `needs_follow_up` 是怎么算的？它决定什么？
 
 <details><summary>答案</summary>
 `needs_follow_up = len(tool_use_blocks) > 0`——模型这轮回复里有没有工具请求。没有 → 走完成分支（completed）；有 → 继续执行工具。它是"这轮到底结束没结束"的分水岭。
 </details>
 
-**Q2.** 为什么重试逻辑要用 `_streamed_any = [False]` 这个单元素列表？
+**Q3.** 为什么重试逻辑要用 `_streamed_any = [False]` 单元素列表？
 
 <details><summary>答案</summary>
-两层原因：① 嵌套函数要修改它，list 是可变对象，闭包才能改（普通 bool 变量改了不生效）；② 语义上"只要已经流式输出过内容就不再重试"——否则会重复给用户显示已输出的文本。
+① 嵌套代码要修改它，list 可变才能改；② 语义上"只要已流式输出过就不再重试"——避免重复给用户显示已输出文本。
 </details>
 
-**Q3.** 工具执行时为什么要分批（并行/独占）？
+**Q4.** Phase 5 终止检查为什么 abort 优先于 max_turns？
 
 <details><summary>答案</summary>
-并发安全的工具（如两个 Read）可以同时跑省时间；并发不安全的工具（如两个 Write 到同一文件）必须串行防冲突。`_partition_tool_calls` 按 `is_concurrent_safe` 标记分组，`asyncio.gather` 并行执行安全批。
+用户中止是"人的意志"，轮数上限是"系统兜底"。同时发生时尊重用户（aborted_tools）而不是报告系统限制（max_turns）——注释明确 "user-driven abort wins"。
 </details>
 
-**Q4.** Phase 5 的终止检查顺序为什么 abort 优先于 max_turns？
+**Q5.** goal 的 `_goal_evaluation_messages` 为什么要裁剪消息？
 
 <details><summary>答案</summary>
-用户中止是"人的意志"，轮数上限是"系统兜底"。如果两个同时发生，应该尊重用户（aborted_tools），而不是报告系统限制（max_turns）——注释明确"user-driven abort wins"。
+评估器只应基于"当前 goal 的证据"判断是否达成。如果给它看上一个 goal 产生的上下文，会泄漏证据、误判。三种情况：goal 没变→全量；变了但找到边界→从边界截；边界被压缩丢→只给本轮输出。
 </details>
 
-**Q5.** `state = QueryState(messages=[*messages, *assistant_messages, *tool_results, ...])` 为什么每轮都重建，而不是原地 append？
+**Q6.** `state = QueryState(messages=[*messages, *assistant_messages, *tool_results, ...])` 为什么每轮重建，而不是原地 append？
 
 <details><summary>答案</summary>
-**不可变快照**设计。每轮生成全新的 QueryState，避免上轮状态被意外修改污染下轮；同时记录 `turn_count`、`transition` 等元信息，方便调试和追溯"这一轮为什么这样"。这也呼应了文档里"消息列表永远是模型视角的完整对话"的不变式。
+**不可变快照**设计。每轮生成全新 QueryState，避免上轮状态被意外修改污染下轮；同时记录 `turn_count`、`transition` 等元信息，方便调试追溯。这也守住了"消息列表永远是模型视角的完整对话"的不变式。
 </details>
-
 ---
 
 ## 总结：一条命令的完整旅程（带真实参数）
